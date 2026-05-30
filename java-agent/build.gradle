@@ -1,0 +1,32 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.egs'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.18.2'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.2'
+    implementation 'dev.langchain4j:langchain4j:1.0.0-beta3'
+    implementation 'dev.langchain4j:langchain4j-open-ai:1.0.0-beta3'
+}
+
+application {
+    mainClass = 'com.egs.javaagent.JavaAgentApplication'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

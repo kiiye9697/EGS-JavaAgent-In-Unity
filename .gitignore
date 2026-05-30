@@ -1,0 +1,12 @@
+.gradle/
+**/.gradle/
+**/build/
+*.log
+*.tmp
+*.bak
+Reference/
+Java大作业模板_已填写.docx
+instruct.md
+Reference/**/__pycache__/
+Reference/**/*.pyc
+Reference/Houdini-Agent-main/config/houdini_ai.ini

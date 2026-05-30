@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EGS Unity Java Agent Envelope",
+  "type": "object",
+  "required": [
+    "requestId",
+    "sessionId",
+    "type",
+    "payload"
+  ],
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "description": "Unique request id created by Unity or Java."
+    },
+    "sessionId": {
+      "type": "string",
+      "description": "Logical conversation id."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "chat",
+        "plan",
+        "memory_query",
+        "memory_upsert",
+        "tool_result",
+        "health"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "userMessage"
+      ],
+      "properties": {
+        "userMessage": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "agent",
+            "plan"
+          ],
+          "default": "agent"
+        },
+        "sceneContext": {
+          "type": "string"
+        },
+        "projectPath": {
+          "type": "string"
+        },
+        "selectedAssets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compileState": {
+          "type": "string"
+        },
+        "compilerMessages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "approvedActions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "proposalPreview": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "target",
+              "proposalPreview"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "unityVersion": {
+          "type": "string"
+        },
+        "clientVersion": {
+          "type": "string"
+        },
+        "timestampUtc": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
