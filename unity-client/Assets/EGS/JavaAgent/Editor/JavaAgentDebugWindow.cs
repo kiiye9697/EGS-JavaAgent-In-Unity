@@ -9,6 +9,8 @@ namespace EGS.JavaAgent.Editor
         private Vector2 _compileScroll;
         private Vector2 _logScroll;
         private Vector2 _actionScroll;
+        private Vector2 _nodeScroll;
+        private Vector2 _windowScroll;
 
         [MenuItem("Window/EGS Java Agent/Debug Console")]
         internal static void OpenWindow()
@@ -31,10 +33,13 @@ namespace EGS.JavaAgent.Editor
         {
             DrawToolbar();
             EditorGUILayout.Space(6f);
+            _windowScroll = EditorGUILayout.BeginScrollView(_windowScroll);
             DrawCompileCard();
+            DrawPlanNodeTraceCard();
             DrawActionResultsCard();
             DrawRollbackCard();
             DrawEventLogCard();
+            EditorGUILayout.EndScrollView();
         }
 
         private void DrawToolbar()
@@ -117,6 +122,41 @@ namespace EGS.JavaAgent.Editor
                 {
                     EditorGUILayout.SelectableLabel(message.ToSummaryLine(), EditorStyles.textArea, GUILayout.MinHeight(32f));
                 }
+            }
+            EditorGUILayout.EndScrollView();
+            EditorGUILayout.EndVertical();
+        }
+
+        private void DrawPlanNodeTraceCard()
+        {
+            EditorGUILayout.BeginVertical("box");
+            EditorGUILayout.LabelField("Plan Node Trace", EditorStyles.boldLabel);
+
+            if (JavaAgentSessionState.PlanNodes.Count == 0)
+            {
+                EditorGUILayout.HelpBox("No plan nodes have been generated yet.", MessageType.None);
+                EditorGUILayout.EndVertical();
+                return;
+            }
+
+            _nodeScroll = EditorGUILayout.BeginScrollView(_nodeScroll, GUILayout.MinHeight(120f), GUILayout.MaxHeight(220f));
+            foreach (var node in JavaAgentSessionState.PlanNodes)
+            {
+                EditorGUILayout.BeginVertical("box");
+                EditorGUILayout.LabelField($"{node.Status} | {node.Title}", EditorStyles.boldLabel);
+                EditorGUILayout.LabelField(node.Detail, EditorStyles.wordWrappedMiniLabel);
+                EditorGUILayout.LabelField($"Actions={node.SuggestedActions.Count} Results={node.ExecutionResults.Count} Changes={node.AppliedChanges.Count}", EditorStyles.miniLabel);
+                foreach (var change in node.AppliedChanges)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField(change.Target, EditorStyles.miniLabel);
+                    if (GUILayout.Button("Rollback", GUILayout.Width(80f)))
+                    {
+                        JavaAgentSessionState.RollbackAppliedChange(change.Id);
+                    }
+                    EditorGUILayout.EndHorizontal();
+                }
+                EditorGUILayout.EndVertical();
             }
             EditorGUILayout.EndScrollView();
             EditorGUILayout.EndVertical();

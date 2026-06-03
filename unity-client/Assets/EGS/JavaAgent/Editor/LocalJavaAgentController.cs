@@ -30,6 +30,13 @@ namespace EGS.JavaAgent.Editor
             }
         }
 
+        internal static async Task<bool> RestartAsync(JavaAgentSettings settings)
+        {
+            StopLikelyAgentProcesses();
+            await Task.Delay(1000);
+            return Start(settings, out _);
+        }
+
         internal static bool Start(JavaAgentSettings settings, out string message)
         {
             try
@@ -68,6 +75,7 @@ namespace EGS.JavaAgent.Editor
                 startInfo.EnvironmentVariables["EGS_AGENT_PROVIDER"] = settings.provider;
                 startInfo.EnvironmentVariables["EGS_AGENT_MODEL"] = settings.model;
                 startInfo.EnvironmentVariables["EGS_AGENT_GATEWAY"] = settings.gateway;
+                ApplyProviderApiKey(startInfo, settings);
 
                 Process.Start(startInfo);
                 message = "Local Java agent launch requested from bundled runtime.";
@@ -77,6 +85,71 @@ namespace EGS.JavaAgent.Editor
             {
                 message = "Failed to launch local Java agent: " + exception.Message;
                 return false;
+            }
+        }
+
+        private static void StopLikelyAgentProcesses()
+        {
+            foreach (var process in Process.GetProcessesByName("java"))
+            {
+                TryStopProcessIfAgent(process);
+            }
+
+            foreach (var process in Process.GetProcessesByName("javaw"))
+            {
+                TryStopProcessIfAgent(process);
+            }
+        }
+
+        private static void TryStopProcessIfAgent(Process process)
+        {
+            try
+            {
+                string mainWindowTitle = process.MainWindowTitle ?? string.Empty;
+                string processPath = string.Empty;
+                try
+                {
+                    processPath = process.MainModule?.FileName ?? string.Empty;
+                }
+                catch
+                {
+                    // Some processes do not allow module inspection; leave them alone.
+                }
+
+                bool looksLikeBundledAgent =
+                    mainWindowTitle.IndexOf("EGS Java Agent", StringComparison.OrdinalIgnoreCase) >= 0
+                    || processPath.Replace('\\', '/').IndexOf("/Assets/EGS/JavaAgent/Embedded/", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!looksLikeBundledAgent)
+                {
+                    return;
+                }
+
+                process.Kill();
+            }
+            catch
+            {
+                // Best effort only. If the process cannot be stopped, health/start will report the remaining state.
+            }
+        }
+
+        private static void ApplyProviderApiKey(ProcessStartInfo startInfo, JavaAgentSettings settings)
+        {
+            string apiKey = settings.GetLocalProviderApiKey();
+            if (string.IsNullOrWhiteSpace(apiKey) && settings.useEnvironmentToken)
+            {
+                apiKey = Environment.GetEnvironmentVariable(settings.ProviderKeyEnvironmentName);
+            }
+
+            if (string.IsNullOrWhiteSpace(apiKey))
+            {
+                return;
+            }
+
+            startInfo.EnvironmentVariables[settings.ProviderKeyEnvironmentName] = apiKey;
+            if (string.Equals(settings.provider, "glm", StringComparison.OrdinalIgnoreCase))
+            {
+                startInfo.EnvironmentVariables["ZHIPU_API_KEY"] = apiKey;
             }
         }
 

@@ -1,114 +1,92 @@
-﻿# EGS Java Agent In Unity
+# EGS Java Agent in Unity
 
-Unity Editor + Java + LangChain4j 的本地智能辅助开发插件。
-它的目标不是替你自动写完所有东西，而是把 Unity 开发里最麻烦的部分整理成一个可审批、可回滚、可调试的工作台。
+A Java course-design project that embeds a Java AI agent into the Unity Editor. The Unity plugin can start the local Java service, send scene-aware requests, review generated file proposals, apply approved changes, attach generated scripts, and roll back applied edits.
 
-## What It Does
+## Current Status
 
-- Unity 内可停靠工作台
-- 审批队列和差异预览
-- 调试控制台和编译反馈
-- 本地 Java 服务 `GET /health`
-- 本地 Java 服务 `POST /v1/agent/execute`
-- DeepSeek / OpenAI / GLM provider 接入
-- LangChain4j 工具调用
-- 参考文档和 URL 注入
-- 选中场景对象和项目文件上下文读取
-- 轻量回滚历史
-- 嵌入式 JDK + Java 服务随 Unity 项目部署
+- Java backend builds successfully with JDK 21 and Gradle 8.14.3.
+- Unity editor plugin has one main workspace: `Window > EGS Java Agent > Workspace`.
+- UI supports Chinese and English switching in the workspace toolbar.
+- Provider API keys can be stored locally in Unity EditorPrefs or read from environment variables.
+- The default model route is DeepSeek + LangChain4j. Missing keys now show setup guidance instead of pretending to run.
 
-## Architecture
+## Quickstart
 
-```text
-Unity Editor
-  -> HTTP request
-  -> Java Agent Orchestrator
-  -> LangChain4j Gateway
-  -> Project read / reference read / proposal generation
-  -> Unity approval queue
-  -> Local write on approval
-  -> Compile feedback + repair loop
+1. Build the Java backend:
+
+```powershell
+$env:JAVA_HOME = "C:\tmp\jdk21\jdk-21.0.5+11"
+$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+cd C:\Users\kiiye\Desktop\EGS-JavaAgent-In-Unity\java-agent
+.\gradlew.bat build --no-daemon
 ```
 
-## Repository Layout
+2. Install the Unity plugin:
 
-- `java-agent/` Java 后端服务
-- `unity-client/` Unity 插件源码
-- `docs/` 设计、部署、验收和 API 文档
-- `scripts/` 部署和辅助脚本
-- `Reference/` 参考工程和资料
-- `protocol/` 请求和响应协议
+Copy `unity-client/Assets/EGS/JavaAgent` into your Unity project at `Assets/EGS/JavaAgent`.
 
-## Quick Start
+3. Configure the provider:
 
-### 1. Prepare Java
-
-Use Java 21.
-
-Known-good local paths:
-
-- JDK: `C:\tmp\jdk21-portable\jdk-21.0.11+10`
-- Gradle: `C:\tmp\gradle-portable\gradle-8.14.3`
-
-### 2. Set provider variables
+Open `Edit > Project Settings > EGS Java Agent`.
 
 For DeepSeek:
 
-```powershell
-[Environment]::SetEnvironmentVariable("EGS_AGENT_PROVIDER", "deepseek", "User")
-[Environment]::SetEnvironmentVariable("EGS_AGENT_MODEL", "deepseek-v4-flash", "User")
-[Environment]::SetEnvironmentVariable("EGS_AGENT_GATEWAY", "langchain4j", "User")
-[Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-xxx", "User")
+```text
+Provider: deepseek
+Gateway: langchain4j
+Model: deepseek-v4-flash
+Required key: DEEPSEEK_API_KEY
 ```
 
-### 3. Build and start Java
+Paste the key into `Local API Key` or set it in the environment.
 
-```powershell
-$env:JAVA_HOME='C:\tmp\jdk21-portable\jdk-21.0.11+10'
-$env:Path='C:\tmp\jdk21-portable\jdk-21.0.11+10\bin;' + $env:Path
-cd C:\Users\kiiye\Desktop\JavaAgent\java-agent
-& 'C:\tmp\gradle-portable\gradle-8.14.3\bin\gradle.bat' installDist
-.\build\install\egs-java-agent\bin\egs-java-agent.bat
+4. Start from Unity:
+
+Open `Window > EGS Java Agent > Workspace`, click `Start Agent`, then `Check Agent`.
+
+5. Use the workflow:
+
+Enter a request, choose a skill profile, optionally add reference files or URLs, click `Send`, review proposals in `Approval Queue`, then approve and apply.
+
+## Unity Workflow
+
+The workspace uses a six-node flow:
+
+```mermaid
+flowchart LR
+    Skill["Skill / 技能"] --> Reference["Reference / 参考"]
+    Reference --> Inspect["Inspect / 检查"]
+    Inspect --> Approve["Approve / 审批"]
+    Approve --> Apply["Apply / 应用"]
+    Apply --> Repair["Repair / 修复"]
+    Repair --> Inspect
 ```
 
-Check:
-
-- `http://localhost:8765/health`
-- `http://localhost:8765/v1/agent/execute`
-
-## Unity Setup
-
-1. Copy `unity-client/Assets/EGS/JavaAgent` into your Unity project `Assets/EGS/JavaAgent`
-2. Open Unity and wait for compile
-3. Open:
-   - `Project Settings -> EGS Java Agent`
-   - `Window -> EGS Java Agent -> Workspace`
-   - `Window -> EGS Java Agent -> Approval Queue`
-   - `Window -> EGS Java Agent -> Debug Console`
-
-## Typical Flow
-
-1. Write a prompt in the workspace
-2. Optionally attach reference files or URLs
-3. Send request to Java agent
-4. Review proposals in Approval Queue
-5. Approve and apply
-6. Watch compile feedback in Debug Console
-7. Use repair loop if needed
+The nodes are not decorative only: they map to concrete plugin state such as selected skill profile, attached references, latest tool results, pending approvals, applied asset snapshots, and compiler repair attempts.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Approval Architecture](docs/approval-architecture.md)
-- [Capability Catalog](docs/capability-catalog.md)
-- [HTTP API](docs/http-api.md)
-- [Java SDK Setup](docs/java-sdk-setup.md)
-- [Unity Deployment](docs/unity-deployment.md)
-- [Acceptance Guide](docs/acceptance-guide.md)
-- [Reference Architecture](docs/reference-architecture.md)
+- [Architecture and UML](docs/architecture-and-uml.md)
+- [Program Flow](docs/program-flow.md)
+- [Modules and Data Structures](docs/modules-and-data.md)
+- [Unity Usage Guide](docs/unity-usage.md)
+
+## Project Layout
+
+```text
+java-agent/
+  src/main/java/com/egs/javaagent/
+  build/install/egs-java-agent/
+unity-client/
+  Assets/EGS/JavaAgent/Editor/
+  Assets/EGS/JavaAgent/Runtime/
+docs/
+  architecture-and-uml.md
+  program-flow.md
+  modules-and-data.md
+  unity-usage.md
+```
 
 ## Notes
 
-- This repository is intentionally structured for course work and GitHub展示.
-- Do not commit API keys.
-- The current product is strongest at script, shader, approval, validation, and rollback workflows.
+Do not commit API keys. Unity stores local keys in `EditorPrefs`, not project assets.

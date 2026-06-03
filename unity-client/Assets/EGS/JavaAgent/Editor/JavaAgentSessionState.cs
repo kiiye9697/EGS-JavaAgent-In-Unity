@@ -32,6 +32,7 @@ namespace EGS.JavaAgent.Editor
         private static readonly List<PendingApprovalItem> ApprovalQueue = new();
         private static readonly List<string> EventLog = new();
         private static readonly List<AppliedChangeRecord> AppliedChangeHistory = new();
+        private static readonly List<PlanTaskNode> PlanTaskNodes = new();
 
         private static string _prompt = "Create a player controller scaffold and list the required Unity files.";
         private static string _referenceInputsText = string.Empty;
@@ -51,10 +52,14 @@ namespace EGS.JavaAgent.Editor
         private static string[] _lastRequestCompilerMessages = Array.Empty<string>();
         private static string _lastAppliedAssetPath = string.Empty;
         private static string _lastWorkflowStatus = "Idle";
+        private static string _selectedPlanNodeId = string.Empty;
+        private static string _activeRequestText = string.Empty;
         private static string _lastAutoRepairCompileStamp = string.Empty;
         private static int _autoRepairAttempts;
         private static bool _attachAfterCompile;
         private static bool _approvalExecutionInFlight;
+        private static bool _workflowRunnerInFlight;
+        private static bool _planNodeExecutionInFlight;
 
         static JavaAgentSessionState()
         {
@@ -154,6 +159,12 @@ namespace EGS.JavaAgent.Editor
         internal static IReadOnlyList<PendingApprovalItem> PendingApprovals => ApprovalQueue;
         internal static IReadOnlyList<string> Logs => EventLog;
         internal static IReadOnlyList<AppliedChangeRecord> AppliedChanges => AppliedChangeHistory;
+        internal static IReadOnlyList<PlanTaskNode> PlanNodes => PlanTaskNodes;
+        internal static IReadOnlyList<CodeMemoryEntry> CodeMemories => CodeMemoryStore.RecentEntries;
+        internal static string SelectedPlanNodeId => _selectedPlanNodeId;
+        internal static bool WorkflowRunnerInFlight => _workflowRunnerInFlight;
+        internal static bool PlanNodeExecutionInFlight => _planNodeExecutionInFlight;
+        internal static IReadOnlyList<UnityToolDescriptor> UnityTools => UnityEditorActionExecutor.ToolCatalog;
         internal static int AutoRepairAttempts => _autoRepairAttempts;
         internal static CompileDiagnosticsTracker.CompileSnapshot CurrentCompileSnapshot => CompileDiagnosticsTracker.GetSnapshot();
 
@@ -165,13 +176,245 @@ namespace EGS.JavaAgent.Editor
             return $"Scene: {sceneName} | Assets: {assetCount} | Objects: {objectCount}";
         }
 
-        internal static async Task SendPromptAsync()
+        internal static PlanTaskNode SelectedPlanNode
         {
-            if (_mode == AgentMode.Plan)
+            get
             {
-                _mode = AgentMode.Agent;
+                if (string.IsNullOrWhiteSpace(_selectedPlanNodeId))
+                {
+                    return PlanTaskNodes.FirstOrDefault();
+                }
+
+                return PlanTaskNodes.FirstOrDefault(node => string.Equals(node.Id, _selectedPlanNodeId, StringComparison.Ordinal));
+            }
+        }
+
+        internal static void SelectPlanNode(string nodeId)
+        {
+            if (string.Equals(_selectedPlanNodeId, nodeId, StringComparison.Ordinal))
+            {
+                return;
             }
 
+            _selectedPlanNodeId = nodeId ?? string.Empty;
+            NotifyChanged();
+        }
+
+        internal static async Task ExecuteSelectedPlanNodeAsync()
+        {
+            var node = SelectedPlanNode;
+            if (node == null || _isBusy)
+            {
+                return;
+            }
+
+            await ExecutePlanNodeAsync(node, applySafeApprovals: false);
+        }
+
+        internal static async Task RunAllPlanNodesAsync(bool applySafeApprovals)
+        {
+            if (_workflowRunnerInFlight || _isBusy)
+            {
+                return;
+            }
+
+            if (PlanTaskNodes.Count == 0)
+            {
+                await SendPromptAsync();
+                return;
+            }
+
+            _workflowRunnerInFlight = true;
+            try
+            {
+                foreach (var node in PlanTaskNodes.ToArray())
+                {
+                    if (node.IsTerminal)
+                    {
+                        continue;
+                    }
+
+                    SelectPlanNode(node.Id);
+                    node.Status = "running";
+                    NotifyChanged();
+
+                    await ExecutePlanNodeAsync(node, applySafeApprovals: false);
+
+                    if (applySafeApprovals)
+                    {
+                        await ApplyApprovalsForNodeAsync(node.Id, safeOnly: true);
+                    }
+                }
+
+                _lastWorkflowStatus = "Plan workflow finished";
+                LogEvent("Plan workflow runner finished.");
+            }
+            finally
+            {
+                _workflowRunnerInFlight = false;
+                NotifyChanged();
+            }
+        }
+
+        private static async Task ExecutePlanNodeAsync(PlanTaskNode node, bool applySafeApprovals)
+        {
+            if (node == null || _isBusy)
+            {
+                return;
+            }
+
+            _planNodeExecutionInFlight = true;
+            try
+            {
+                await ExecuteUserMessageAsync(
+                    BuildPlanNodePrompt(node),
+                    Array.Empty<AgentApprovedAction>(),
+                    $"Executing plan node {node.Title}",
+                    "Waiting for node response",
+                    Array.Empty<PendingFileSnapshot>()
+                );
+
+                if (applySafeApprovals)
+                {
+                    await ApplyApprovalsForNodeAsync(node.Id, safeOnly: true);
+                }
+            }
+            finally
+            {
+                _planNodeExecutionInFlight = false;
+                NotifyChanged();
+            }
+        }
+
+        internal static async Task ApplySelectedNodeApprovalsAsync(bool safeOnly)
+        {
+            var node = SelectedPlanNode;
+            if (node == null)
+            {
+                return;
+            }
+
+            await ApplyApprovalsForNodeAsync(node.Id, safeOnly);
+        }
+
+        internal static async Task ApplyAllApprovalsAsync(bool safeOnly)
+        {
+            await ApplyApprovalsInternalAsync(ApprovalQueue.ToArray(), safeOnly);
+        }
+
+        private static async Task ApplyApprovalsForNodeAsync(string nodeId, bool safeOnly)
+        {
+            if (string.IsNullOrWhiteSpace(nodeId))
+            {
+                return;
+            }
+
+            var candidates = ApprovalQueue
+                .Where(item => item != null && string.Equals(item.NodeId, nodeId, StringComparison.Ordinal))
+                .ToArray();
+            await ApplyApprovalsInternalAsync(candidates, safeOnly);
+        }
+
+        private static async Task ApplyApprovalsInternalAsync(PendingApprovalItem[] candidates, bool safeOnly)
+        {
+            if (candidates == null || candidates.Length == 0 || _approvalExecutionInFlight)
+            {
+                return;
+            }
+
+            var executable = candidates
+                .Where(item => item != null && (!safeOnly || item.IsSafeCreateCandidate || item.IsUnityEditorAction))
+                .ToArray();
+            if (executable.Length == 0)
+            {
+                LogEvent("No matching approvals were safe to apply.");
+                NotifyChanged();
+                return;
+            }
+
+            var unityActions = executable.Where(item => item.IsUnityEditorAction).ToArray();
+            foreach (var item in unityActions)
+            {
+                await ApplyApprovalAsync(item);
+            }
+
+            var fileActions = executable.Where(item => !item.IsUnityEditorAction).ToArray();
+            if (fileActions.Length == 0)
+            {
+                return;
+            }
+
+            _approvalExecutionInFlight = true;
+            try
+            {
+                var approvedActions = fileActions
+                    .Select(item => new AgentApprovedAction
+                    {
+                        type = item.Action.type,
+                        target = item.Action.target,
+                        reason = item.Action.reason,
+                        proposalPreview = item.Action.proposalPreview
+                    })
+                    .ToArray();
+                var snapshots = SnapshotApprovedActions(approvedActions);
+                for (int index = 0; index < snapshots.Length && index < fileActions.Length; index++)
+                {
+                    snapshots[index].NodeId = fileActions[index].NodeId;
+                }
+
+                await ExecuteUserMessageAsync(
+                    $"Apply {approvedActions.Length} approved proposal(s) from the node workflow.",
+                    approvedActions,
+                    "Applying node workflow approvals",
+                    "Waiting for apply response",
+                    snapshots
+                );
+
+                foreach (var item in fileActions)
+                {
+                    ApprovalQueue.RemoveAll(entry => entry.Id == item.Id);
+                }
+
+                LogEvent($"Applied {approvedActions.Length} file approval(s).");
+            }
+            finally
+            {
+                _approvalExecutionInFlight = false;
+                NotifyChanged();
+            }
+        }
+
+        internal static void UseCodeMemoryAsPrompt(string memoryId, bool useAfterContent)
+        {
+            var memory = CodeMemoryStore.Find(memoryId);
+            if (memory == null)
+            {
+                return;
+            }
+
+            string content = useAfterContent ? memory.afterContent : memory.beforeContent;
+            Prompt =
+                "Continue iterating from this stored code memory.\n\n"
+                + "Target: " + memory.target + "\n"
+                + "Original request: " + memory.request + "\n"
+                + "Memory summary: " + memory.summary + "\n\n"
+                + "Code:\n```csharp\n"
+                + (content ?? string.Empty)
+                + "\n```";
+            _lastWorkflowStatus = "Loaded code memory into prompt";
+            LogEvent("Loaded code memory for " + memory.target + " into prompt.");
+            NotifyChanged();
+        }
+
+        internal static void DeleteCodeMemory(string memoryId)
+        {
+            CodeMemoryStore.Remove(memoryId);
+            _lastWorkflowStatus = "Code memory removed";
+            NotifyChanged();
+        }
+
+        internal static async Task SendPromptAsync()
+        {
             await ExecuteUserMessageAsync(BuildEffectivePrompt(_prompt), Array.Empty<AgentApprovedAction>(), "Sending request to Java agent", "Waiting for agent response", Array.Empty<PendingFileSnapshot>());
         }
 
@@ -209,6 +452,30 @@ namespace EGS.JavaAgent.Editor
                 LogEvent(message);
                 NotifyChanged();
             }
+        }
+
+        internal static async Task RestartAgentAsync()
+        {
+            var settings = JavaAgentSettings.instance;
+            _agentHealthStatus = "Restarting";
+            _lastWorkflowStatus = "Restarting local Java agent";
+            LogEvent("Restarting local Java agent.");
+            NotifyChanged();
+
+            bool started = await LocalJavaAgentController.RestartAsync(settings);
+            if (!started)
+            {
+                _agentHealthKnown = true;
+                _agentHealthy = false;
+                _agentHealthStatus = "Restart failed";
+                _lastWorkflowStatus = "Restart failed";
+                LogEvent("Restart failed.");
+                NotifyChanged();
+                return;
+            }
+
+            await Task.Delay(3000);
+            await RefreshAgentHealthAsync();
         }
 
         internal static async Task RepairFromCompilerErrorsAsync(bool triggeredAutomatically)
@@ -277,7 +544,18 @@ namespace EGS.JavaAgent.Editor
                     reason = item.Action.reason,
                     proposalPreview = item.Action.proposalPreview
                 };
+
+                if (UnityEditorActionExecutor.IsUnityEditorAction(approvedAction.type))
+                {
+                    ApplyUnityEditorAction(item, approvedAction);
+                    return;
+                }
+
                 var snapshots = SnapshotApprovedActions(new[] { approvedAction });
+                foreach (var snapshot in snapshots)
+                {
+                    snapshot.NodeId = item.NodeId;
+                }
 
                 await ExecuteUserMessageAsync(
                     $"Apply the approved proposal for {item.Action.target}.",
@@ -297,45 +575,60 @@ namespace EGS.JavaAgent.Editor
             }
         }
 
-        internal static async Task ApproveAllSafeCreatesAsync()
+        private static void ApplyUnityEditorAction(PendingApprovalItem item, AgentApprovedAction approvedAction)
         {
-            var candidates = ApprovalQueue
-                .Where(item => item != null && item.IsSafeCreateCandidate)
-                .ToArray();
+            bool handled = UnityEditorActionExecutor.TryExecute(approvedAction, out var result);
+            _lastActionExecutionResults = AppendExecutionResult(_lastActionExecutionResults, result);
+            _lastToolExecutionSummary = BuildLocalToolSummary(_lastActionExecutionResults);
+            UpdatePlanNodeAfterApproval(item, result, null);
+            _lastWorkflowStatus = result.success ? "Unity action applied" : "Unity action failed";
+            _response = result.success
+                ? $"Unity action applied:\n[{result.type}] {result.target}\n{result.output}"
+                : $"Unity action failed:\n[{result.type}] {result.target}\n{result.output}";
 
-            if (candidates.Length == 0)
+            if (handled && result.success)
             {
-                LogEvent("No safe create-file proposals were available for bulk approval.");
-                NotifyChanged();
+                _lastAppliedAssetPath = result.target;
+                ApprovalQueue.RemoveAll(entry => entry.Id == item.Id);
+                LogEvent($"Applied Unity editor action {approvedAction.type} -> {approvedAction.target}.");
+            }
+            else
+            {
+                LogEvent($"Unity editor action failed {approvedAction.type} -> {approvedAction.target}: {result.output}");
+            }
+
+            NotifyChanged();
+        }
+
+        private static void UpdatePlanNodeAfterApproval(PendingApprovalItem item, AgentActionExecutionResult result, AppliedChangeRecord change)
+        {
+            string nodeId = item?.NodeId;
+            if (string.IsNullOrWhiteSpace(nodeId))
+            {
                 return;
             }
 
-            var approvedActions = candidates
-                .Select(candidate => new AgentApprovedAction
-                {
-                    type = candidate.Action.type,
-                    target = candidate.Action.target,
-                    reason = candidate.Action.reason,
-                    proposalPreview = candidate.Action.proposalPreview
-                })
-                .ToArray();
-            var snapshots = SnapshotApprovedActions(approvedActions);
-
-            await ExecuteUserMessageAsync(
-                $"Apply {approvedActions.Length} pre-approved create-file proposal(s) in the Unity project.",
-                approvedActions,
-                "Applying safe create-file proposals",
-                "Waiting for bulk apply response",
-                snapshots
-            );
-
-            foreach (var candidate in candidates)
+            var node = PlanTaskNodes.FirstOrDefault(entry => string.Equals(entry.Id, nodeId, StringComparison.Ordinal));
+            if (node == null)
             {
-                ApprovalQueue.RemoveAll(entry => entry.Id == candidate.Id);
+                return;
             }
 
-            LogEvent($"Bulk-approved {approvedActions.Length} safe create-file proposal(s).");
-            NotifyChanged();
+            if (result != null)
+            {
+                node.ExecutionResults.Add(result);
+                node.Status = result.success ? "completed" : "failed";
+            }
+
+            if (change != null)
+            {
+                node.AppliedChanges.Insert(0, change);
+            }
+        }
+
+        internal static async Task ApproveAllSafeCreatesAsync()
+        {
+            await ApplyAllApprovalsAsync(safeOnly: true);
         }
 
         internal static void RejectApproval(string approvalId)
@@ -450,6 +743,7 @@ namespace EGS.JavaAgent.Editor
                 _response = $"Rolled back {record.Target}.";
                 LogEvent($"Rolled back {record.Target}.");
                 AppliedChangeHistory.RemoveAll(item => item.Id == changeId);
+                MarkNodeRolledBack(record.NodeId, record.Target);
                 NotifyChanged();
             }
             catch (Exception exception)
@@ -562,8 +856,29 @@ namespace EGS.JavaAgent.Editor
             }
 
             var settings = JavaAgentSettings.instance;
+            if (!settings.HasConfiguredProviderApiKey())
+            {
+                _lastWorkflowStatus = "Provider API key missing";
+                _response =
+                    "Provider API key is missing.\n\n"
+                    + "Open Edit > Project Settings > EGS Java Agent, paste the provider key into Local API Key, "
+                    + "then click Save Local API Key and Start Agent again.\n\n"
+                    + "Required environment variable for the current provider: "
+                    + settings.ProviderKeyEnvironmentName;
+                LogEvent("Request blocked because provider API key is missing.");
+                NotifyChanged();
+                return;
+            }
+
+            if (_lastDiagnostics != null && !_lastDiagnostics.apiKeyPresent)
+            {
+                LogEvent("Last diagnostics reported ApiKeyLoaded=false. Restarting local Java agent before retry.");
+                await RestartAgentAsync();
+            }
+
             _isBusy = true;
             _lastWorkflowStatus = sendingStatus;
+            _activeRequestText = userMessage ?? string.Empty;
             _response = "Calling Java Agent...";
             LogEvent($"{sendingStatus}.");
             NotifyChanged();
@@ -614,12 +929,29 @@ namespace EGS.JavaAgent.Editor
         private static void ApplyAgentResult(AgentResponse result, AgentEnvelope envelope)
         {
             _lastDiagnostics = result.diagnostics;
-            _lastSuggestedActions = result.suggestedActions ?? Array.Empty<AgentSuggestedAction>();
+            _lastSuggestedActions = MergeClientSuggestedActions(
+                result.suggestedActions ?? Array.Empty<AgentSuggestedAction>(),
+                envelope.payload.userMessage
+            );
             _lastActionExecutionResults = result.actionExecutionResults ?? Array.Empty<AgentActionExecutionResult>();
             _lastToolExecutionSummary = result.toolExecutionSummary;
             _lastDetectedIssues = result.detectedIssues ?? Array.Empty<AgentIssue>();
             _lastRequestCompilerMessages = envelope.payload.compilerMessages ?? Array.Empty<string>();
             _lastWorkflowStatus = result.success ? "Agent response received" : "Agent response failed";
+            bool isApplyTurn = envelope.payload.approvedActions != null && envelope.payload.approvedActions.Length > 0;
+            bool isNodeTurn = _planNodeExecutionInFlight && !isApplyTurn;
+            if (isApplyTurn)
+            {
+                AttachResultsToPlanNodes(_lastActionExecutionResults);
+            }
+            else if (isNodeTurn)
+            {
+                MergePlanNodeTurnResult(result);
+            }
+            else
+            {
+                RebuildPlanTaskNodes(result, envelope);
+            }
             RebuildApprovalQueue(_lastSuggestedActions);
             AppendHistory(result, envelope);
             _response = result.success
@@ -635,9 +967,231 @@ namespace EGS.JavaAgent.Editor
             NotifyChanged();
         }
 
+        private static AgentSuggestedAction[] MergeClientSuggestedActions(AgentSuggestedAction[] serverActions, string userMessage)
+        {
+            var merged = new List<AgentSuggestedAction>();
+            if (serverActions != null)
+            {
+                merged.AddRange(serverActions.Where(action => action != null));
+            }
+
+            foreach (var action in BuildClientSuggestedActions(userMessage))
+            {
+                bool exists = merged.Any(existing =>
+                    string.Equals(existing.type, action.type, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(existing.target, action.target, StringComparison.OrdinalIgnoreCase));
+                if (!exists)
+                {
+                    merged.Add(action);
+                }
+            }
+
+            return merged.ToArray();
+        }
+
+        private static IEnumerable<AgentSuggestedAction> BuildClientSuggestedActions(string userMessage)
+        {
+            string normalized = userMessage ?? string.Empty;
+            bool wantsTestCharacter =
+                normalized.IndexOf("capsule", StringComparison.OrdinalIgnoreCase) >= 0
+                || normalized.IndexOf("third person", StringComparison.OrdinalIgnoreCase) >= 0
+                || normalized.Contains("胶囊")
+                || normalized.Contains("第三人称")
+                || normalized.Contains("测试角色")
+                || normalized.Contains("移动脚本");
+
+            if (wantsTestCharacter)
+            {
+                yield return UnityEditorActionExecutor.CreateTestCharacterSuggestion(
+                    "The request asks for a usable scene test character. This Unity editor action creates and selects it directly after approval."
+                );
+            }
+        }
+
+        private static void RebuildPlanTaskNodes(AgentResponse result, AgentEnvelope envelope)
+        {
+            PlanTaskNodes.Clear();
+
+            var steps = result.planSteps ?? Array.Empty<AgentPlanStep>();
+            if (steps.Length == 0)
+            {
+                PlanTaskNodes.Add(new PlanTaskNode(
+                    Guid.NewGuid().ToString("N"),
+                    "Agent response",
+                    result.planSummary ?? "Review the latest agent response.",
+                    "ready",
+                    envelope.payload.userMessage
+                ));
+            }
+            else
+            {
+                for (int index = 0; index < steps.Length; index++)
+                {
+                    var step = steps[index];
+                    PlanTaskNodes.Add(new PlanTaskNode(
+                        Guid.NewGuid().ToString("N"),
+                        string.IsNullOrWhiteSpace(step.title) ? $"Step {index + 1}" : step.title,
+                        step.detail ?? string.Empty,
+                        step.status ?? "pending",
+                        envelope.payload.userMessage
+                    ));
+                }
+            }
+
+            AttachActionsToPlanNodes(_lastSuggestedActions);
+            AttachResultsToPlanNodes(_lastActionExecutionResults);
+            if (PlanTaskNodes.Count > 0)
+            {
+                _selectedPlanNodeId = PlanTaskNodes[0].Id;
+            }
+        }
+
+        private static void MergePlanNodeTurnResult(AgentResponse result)
+        {
+            var node = SelectedPlanNode;
+            if (node == null)
+            {
+                return;
+            }
+
+            node.Status = result.success ? "review" : "failed";
+            node.LastAssistantMessage = result.assistantMessage ?? string.Empty;
+            foreach (var action in _lastSuggestedActions)
+            {
+                if (action == null)
+                {
+                    continue;
+                }
+
+                bool exists = node.SuggestedActions.Any(existing =>
+                    string.Equals(existing.type, action.type, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(existing.target, action.target, StringComparison.OrdinalIgnoreCase));
+                if (!exists)
+                {
+                    node.SuggestedActions.Add(action);
+                }
+            }
+
+            foreach (var executionResult in _lastActionExecutionResults)
+            {
+                if (executionResult != null)
+                {
+                    node.ExecutionResults.Add(executionResult);
+                }
+            }
+        }
+
+        private static void AttachActionsToPlanNodes(IEnumerable<AgentSuggestedAction> actions)
+        {
+            var nodes = PlanTaskNodes.ToArray();
+            if (nodes.Length == 0)
+            {
+                return;
+            }
+
+            foreach (var action in actions ?? Array.Empty<AgentSuggestedAction>())
+            {
+                if (action == null)
+                {
+                    continue;
+                }
+
+                ResolveNodeForAction(action)?.SuggestedActions.Add(action);
+            }
+        }
+
+        private static void AttachResultsToPlanNodes(IEnumerable<AgentActionExecutionResult> results)
+        {
+            foreach (var result in results ?? Array.Empty<AgentActionExecutionResult>())
+            {
+                if (result == null)
+                {
+                    continue;
+                }
+
+                var node = ResolveNodeForResult(result);
+                if (node == null)
+                {
+                    continue;
+                }
+
+                node.ExecutionResults.Add(result);
+                node.Status = result.success ? "completed" : "failed";
+            }
+        }
+
+        private static PlanTaskNode ResolveNodeForAction(AgentSuggestedAction action)
+        {
+            if (PlanTaskNodes.Count == 0)
+            {
+                return null;
+            }
+
+            if (UnityEditorActionExecutor.IsUnityEditorAction(action.type))
+            {
+                return FindPlanNode("Apply") ?? PlanTaskNodes.Last();
+            }
+
+            if (action.approvalRequired)
+            {
+                return FindPlanNode("Approve") ?? FindPlanNode("Prepare") ?? PlanTaskNodes.Last();
+            }
+
+            return FindPlanNode("Inspect") ?? PlanTaskNodes.First();
+        }
+
+        private static PlanTaskNode ResolveNodeForResult(AgentActionExecutionResult result)
+        {
+            if (PlanTaskNodes.Count == 0)
+            {
+                return null;
+            }
+
+            if (result.type != null && result.type.StartsWith("approved_", StringComparison.OrdinalIgnoreCase))
+            {
+                return FindPlanNode("Apply") ?? PlanTaskNodes.Last();
+            }
+
+            if (result.type != null && result.type.Contains("read", StringComparison.OrdinalIgnoreCase))
+            {
+                return FindPlanNode("Inspect") ?? PlanTaskNodes.First();
+            }
+
+            return PlanTaskNodes.Last();
+        }
+
+        private static PlanTaskNode FindPlanNode(string titlePart)
+        {
+            return PlanTaskNodes.FirstOrDefault(node =>
+                node.Title.IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) >= 0
+                || node.Detail.IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static string BuildPlanNodePrompt(PlanTaskNode node)
+        {
+            string memorySummary = CodeMemoryStore.RecentEntries.Count == 0
+                ? "No stored code memories yet."
+                : string.Join(
+                    "\n",
+                    CodeMemoryStore.RecentEntries.Take(6).Select(memory =>
+                        $"- {memory.timestampLocal} | {memory.target} | {memory.summary}"
+                    )
+                );
+
+            return
+                "Execute this selected plan node only. Keep the change small and reviewable.\n\n"
+                + "Node: " + node.Title + "\n"
+                + "Node detail: " + node.Detail + "\n"
+                + "Original request: " + node.Request + "\n\n"
+                + "Stored code memories:\n" + memorySummary;
+        }
+
         private static void RebuildApprovalQueue(IEnumerable<AgentSuggestedAction> actions)
         {
-            ApprovalQueue.Clear();
+            var existingKeys = ApprovalQueue
+                .Where(item => item?.Action != null)
+                .Select(item => item.Action.type + "::" + item.Action.target)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var action in actions ?? Array.Empty<AgentSuggestedAction>())
             {
                 if (action == null || !action.approvalRequired || string.IsNullOrWhiteSpace(action.proposalPreview))
@@ -645,7 +1199,15 @@ namespace EGS.JavaAgent.Editor
                     continue;
                 }
 
-                ApprovalQueue.Add(new PendingApprovalItem(action));
+                string key = action.type + "::" + action.target;
+                if (existingKeys.Contains(key))
+                {
+                    continue;
+                }
+
+                var node = ResolveNodeForAction(action);
+                ApprovalQueue.Add(new PendingApprovalItem(action, node?.Id, node?.Title));
+                existingKeys.Add(key);
             }
         }
 
@@ -671,6 +1233,7 @@ namespace EGS.JavaAgent.Editor
             AssetDatabase.Refresh();
             LogEvent($"Applied file write to {_lastAppliedAssetPath}.");
             CommitPendingSnapshots(result, pendingSnapshots);
+            AttachResultsToPlanNodes(result.actionExecutionResults ?? Array.Empty<AgentActionExecutionResult>());
         }
 
         private static void OnCompileSnapshotChanged(CompileDiagnosticsTracker.CompileSnapshot snapshot)
@@ -936,6 +1499,38 @@ namespace EGS.JavaAgent.Editor
             return firstLineBreak >= 0 ? output.Substring(0, firstLineBreak) : output;
         }
 
+        private static AgentActionExecutionResult[] AppendExecutionResult(
+            AgentActionExecutionResult[] existingResults,
+            AgentActionExecutionResult newResult)
+        {
+            var results = new List<AgentActionExecutionResult>();
+            if (existingResults != null)
+            {
+                results.AddRange(existingResults.Where(result => result != null));
+            }
+
+            if (newResult != null)
+            {
+                results.Add(newResult);
+            }
+
+            return results.ToArray();
+        }
+
+        private static AgentToolExecutionSummary BuildLocalToolSummary(AgentActionExecutionResult[] results)
+        {
+            int attempted = results?.Length ?? 0;
+            int succeeded = results?.Count(result => result != null && result.success) ?? 0;
+            int failed = attempted - succeeded;
+            return new AgentToolExecutionSummary
+            {
+                attemptedActions = attempted,
+                successfulActions = succeeded,
+                failedActions = failed,
+                summary = $"Attempted {attempted} action(s); {succeeded} succeeded, {failed} failed."
+            };
+        }
+
         private static bool IsRangeReadResult(AgentActionExecutionResult result)
         {
             return result != null
@@ -1002,21 +1597,84 @@ namespace EGS.JavaAgent.Editor
                     continue;
                 }
 
-                AppliedChangeHistory.Insert(0, new AppliedChangeRecord(
-                    Guid.NewGuid().ToString("N"),
+                string currentContent = File.Exists(snapshot.AbsolutePath)
+                    ? File.ReadAllText(snapshot.AbsolutePath)
+                    : string.Empty;
+                string changeId = Guid.NewGuid().ToString("N");
+                string memoryId = Guid.NewGuid().ToString("N");
+                var record = new AppliedChangeRecord(
+                    changeId,
+                    snapshot.NodeId,
+                    memoryId,
                     snapshot.Target,
                     snapshot.AbsolutePath,
                     snapshot.ExistedBefore,
                     snapshot.PreviousContent,
+                    currentContent,
                     snapshot.ActionType,
                     DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
-                ));
+                );
+                AppliedChangeHistory.Insert(0, record);
+                RegisterAppliedChangeWithNode(record);
+                CodeMemoryStore.Add(new CodeMemoryEntry
+                {
+                    id = memoryId,
+                    nodeId = snapshot.NodeId,
+                    request = _activeRequestText,
+                    target = snapshot.Target,
+                    actionType = snapshot.ActionType,
+                    timestampLocal = record.TimestampLocal,
+                    existedBefore = snapshot.ExistedBefore,
+                    beforeContent = snapshot.PreviousContent ?? string.Empty,
+                    afterContent = currentContent,
+                    summary = snapshot.ActionType + " -> " + snapshot.Target
+                });
             }
 
             while (AppliedChangeHistory.Count > 20)
             {
                 AppliedChangeHistory.RemoveAt(AppliedChangeHistory.Count - 1);
             }
+        }
+
+        private static void RegisterAppliedChangeWithNode(AppliedChangeRecord record)
+        {
+            if (record == null || string.IsNullOrWhiteSpace(record.NodeId))
+            {
+                return;
+            }
+
+            var node = PlanTaskNodes.FirstOrDefault(item => string.Equals(item.Id, record.NodeId, StringComparison.Ordinal));
+            if (node == null)
+            {
+                return;
+            }
+
+            node.AppliedChanges.Insert(0, record);
+            node.Status = "completed";
+        }
+
+        private static void MarkNodeRolledBack(string nodeId, string target)
+        {
+            if (string.IsNullOrWhiteSpace(nodeId))
+            {
+                return;
+            }
+
+            var node = PlanTaskNodes.FirstOrDefault(item => string.Equals(item.Id, nodeId, StringComparison.Ordinal));
+            if (node == null)
+            {
+                return;
+            }
+
+            node.Status = "rolled_back";
+            node.ExecutionResults.Add(new AgentActionExecutionResult
+            {
+                type = "rollback",
+                target = target,
+                success = true,
+                output = "Rolled back from node history."
+            });
         }
 
         private static string ResolveProjectTargetPath(string target)
@@ -1173,10 +1831,13 @@ namespace EGS.JavaAgent.Editor
 
         internal sealed class PendingApprovalItem
         {
-            internal PendingApprovalItem(AgentSuggestedAction action)
+            internal PendingApprovalItem(AgentSuggestedAction action, string nodeId, string nodeTitle)
             {
                 Id = Guid.NewGuid().ToString("N");
                 Action = action;
+                NodeId = nodeId ?? string.Empty;
+                NodeTitle = nodeTitle ?? string.Empty;
+                IsUnityEditorAction = UnityEditorActionExecutor.IsUnityEditorAction(action.type);
                 IsSafeCreateCandidate =
                     string.Equals(action.type, "suggest_create_file", StringComparison.OrdinalIgnoreCase)
                     && !string.IsNullOrWhiteSpace(action.target)
@@ -1185,27 +1846,36 @@ namespace EGS.JavaAgent.Editor
 
             internal string Id { get; }
             internal AgentSuggestedAction Action { get; }
+            internal string NodeId { get; }
+            internal string NodeTitle { get; }
+            internal bool IsUnityEditorAction { get; }
             internal bool IsSafeCreateCandidate { get; }
         }
 
         internal sealed class AppliedChangeRecord
         {
-            internal AppliedChangeRecord(string id, string target, string absolutePath, bool existedBefore, string previousContent, string actionType, string timestampLocal)
+            internal AppliedChangeRecord(string id, string nodeId, string memoryId, string target, string absolutePath, bool existedBefore, string previousContent, string currentContent, string actionType, string timestampLocal)
             {
                 Id = id;
+                NodeId = nodeId ?? string.Empty;
+                MemoryId = memoryId ?? string.Empty;
                 Target = target;
                 AbsolutePath = absolutePath;
                 ExistedBefore = existedBefore;
                 PreviousContent = previousContent;
+                CurrentContent = currentContent;
                 ActionType = actionType;
                 TimestampLocal = timestampLocal;
             }
 
             internal string Id { get; }
+            internal string NodeId { get; }
+            internal string MemoryId { get; }
             internal string Target { get; }
             internal string AbsolutePath { get; }
             internal bool ExistedBefore { get; }
             internal string PreviousContent { get; }
+            internal string CurrentContent { get; }
             internal string ActionType { get; }
             internal string TimestampLocal { get; }
         }
@@ -1221,11 +1891,38 @@ namespace EGS.JavaAgent.Editor
                 ActionType = actionType;
             }
 
+            internal string NodeId { get; set; }
             internal string Target { get; }
             internal string AbsolutePath { get; }
             internal bool ExistedBefore { get; }
             internal string PreviousContent { get; }
             internal string ActionType { get; }
+        }
+
+        internal sealed class PlanTaskNode
+        {
+            internal PlanTaskNode(string id, string title, string detail, string status, string request)
+            {
+                Id = id;
+                Title = title;
+                Detail = detail;
+                Status = status;
+                Request = request;
+            }
+
+            internal string Id { get; }
+            internal string Title { get; }
+            internal string Detail { get; }
+            internal string Request { get; }
+            internal string Status { get; set; }
+            internal string LastAssistantMessage { get; set; }
+            internal bool IsTerminal =>
+                string.Equals(Status, "completed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(Status, "failed", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(Status, "rolled_back", StringComparison.OrdinalIgnoreCase);
+            internal List<AgentSuggestedAction> SuggestedActions { get; } = new();
+            internal List<AgentActionExecutionResult> ExecutionResults { get; } = new();
+            internal List<AppliedChangeRecord> AppliedChanges { get; } = new();
         }
     }
 }
